@@ -1,0 +1,294 @@
+# `expand_long` Module Documentation
+
+## Overview
+
+The `expand_long` module converts subject-level right-censored survival data into piecewise-exponential (PE) long format suitable for Poisson-based survival modeling.
+
+This transformation is required for:
+
+- Piecewise exponential models  
+- Poisson trick implementations  
+- Bayesian Poisson regression for survival  
+- Diagnostics and prediction routines operating on interval-level data  
+
+The design emphasizes:
+
+- Deterministic ID handling  
+- Explicit stepwise construction  
+- Strong invariants and validation  
+- Safe handling of breakpoint events  
+
+---
+
+# 1. Input Data Structure
+
+## Subject-Level DataFrame
+
+Each row represents one subject.
+
+Required columns:
+
+- `time` (or `cfg.time_col`)  
+  Nonnegative follow-up time (days in this project)
+
+- `event` (or `cfg.event_col`)  
+  Binary indicator:
+  - 1 = event observed  
+  - 0 = right censored  
+
+Optional columns:
+
+- Numeric covariates (e.g., age, comorbidity index)  
+- Categorical covariates (e.g., stage, sex)  
+- Any baseline features to be repeated onto interval rows  
+
+Validation rules:
+
+- `time` must be finite and ≥ 0  
+- `event` must be coded {0,1}  
+
+---
+
+# 2. Breakpoints
+
+`breaks` is a strictly increasing 1D array:
+
+- Must start at 0  
+- Defines interval boundaries  
+- If length = K+1, then there are K intervals  
+
+Example (5-year follow-up in days):
+
+0, 30, 60, 90, ..., 1825
+
+Each interval is:
+
+[t_left_k, t_right_k]
+
+---
+
+# 3. Output Data Structure
+
+## Long DataFrame
+
+One row per subject × interval (after filtering).
+
+### Structural columns
+
+- `__row_id__` (or `cfg.id_col`)  
+  Created internally as 0..n-1  
+  Unique per input row  
+  Used for grouping and invariants  
+
+- `k`  
+  Interval index 0..K-1  
+
+- `t_left`  
+- `t_right`  
+- `width`  
+
+### Likelihood components
+
+- `y`  
+  Exposure (time-at-risk) in interval k  
+
+- `d`  
+  Interval event indicator (0/1)  
+  Exactly one row per event subject has d = 1  
+
+### Repeated covariates
+
+- Baseline features specified by `keep_cols`  
+
+### Filtering rule
+
+- Rows with y == 0 are dropped  
+- Except rows with d == 1 are retained  
+  This ensures events at time 0 are not lost  
+
+---
+
+# 4. Mathematical Formulation
+
+For subject i and interval k:
+
+Exposure:
+
+y_ik = max(0, min(T_i, t_right_k) − t_left_k)
+
+Event assignment:
+
+For event subjects, exactly one interval receives:
+
+d_ik = 1
+
+All other intervals:
+
+d_ik = 0
+
+Invariant:
+
+Sum over k of y_ik equals T_i (after clipping)
+
+Sum over k of d_ik equals event_i
+
+---
+
+# 5. Step-by-Step Construction
+
+The module builds the long data in explicit stages.
+
+---
+
+## Step 0 — Validation
+
+Functions:
+
+- `validate_breaks`
+- `validate_survival_df`
+
+Responsibilities:
+
+- Ensure break grid is valid  
+- Ensure survival columns exist and are well-formed  
+
+---
+
+## Step 1 — `make_base`
+
+Creates a canonical subject-level table.
+
+What it does:
+
+- Resets index  
+- Creates structural ID `__row_id__ = 0..n-1`  
+- Optionally clips time to final breakpoint  
+- Coerces event to int  
+- Selects:
+
+[id_col, time_col, event_col] + covariates
+
+Why this matters:
+
+- Avoids dependence on any input `id` column  
+- Guarantees unique grouping key  
+- Prevents downstream grouping failures  
+
+---
+
+## Step 2 — `expand_exposure`
+
+Constructs interval rows and computes exposures.
+
+Procedure:
+
+- Repeat each subject across all intervals  
+- Build interval grid columns  
+- Compute exposure vectorized:
+
+y = max(0, min(T_rep, t_right) − t_left)
+
+- Initialize d = 0  
+- Repeat covariates  
+
+Invariant validated here:
+
+Sum over k of y_ik equals T_i
+
+---
+
+## Step 3 — `assign_events`
+
+Assigns d = 1 for event subjects.
+
+Goal:
+
+- Exactly one interval per event subject gets d = 1  
+- Interval chosen must have positive exposure when possible  
+
+Algorithm:
+
+1. Candidate interval:
+
+k = searchsorted(breaks[1:], T, side="right")
+
+2. Check exposure in that interval:
+
+y_candidate = max(0, min(T, breaks[k+1]) − breaks[k])
+
+3. If exposure is zero:
+
+Shift to k−1 (if possible)
+
+4. If still zero (T == 0 case):
+
+Force k = 0
+
+5. Mark the (id, k) row with d = 1 using vectorized mapping
+
+Invariant validated here:
+
+Sum over k of d_ik equals event_i
+
+---
+
+## Final Step — `expand_to_long`
+
+Pipeline:
+
+1. base = make_base(...)
+2. long_df = expand_exposure(...)
+3. long_df = assign_events(...)
+4. Drop zero-exposure rows except event rows  
+
+Returns final long-format DataFrame.
+
+---
+
+# 6. Configuration: `ExpandLongConfig`
+
+Fields:
+
+- `time_col`
+- `event_col`
+- `id_col`
+- `keep_cols`
+- `clip_to_followup`
+- `eps`
+
+Key conventions:
+
+- `id_col` is always created internally  
+- `keep_cols=None` means carry all baseline covariates  
+- `eps` controls zero-exposure tolerance  
+
+---
+
+# 7. Recommended Invariants for Testing
+
+After expansion, verify:
+
+1. No duplicate columns  
+2. y ≥ 0 for all rows  
+3. Sum over k of y_ik equals clipped T_i  
+4. Sum over k of d_ik equals event_i  
+5. Each event subject has exactly one d == 1 row  
+
+These checks ensure the long construction is mathematically correct before fitting.
+
+---
+
+# 8. Intended Downstream Usage
+
+The resulting long DataFrame is ready for:
+
+- Poisson GLM fitting  
+- Bayesian PE modeling  
+- Diagnostics (e.g., cumulative hazard reconstruction)  
+- Prediction routines  
+
+The model likelihood uses:
+
+d_ik ~ Poisson(y_ik × λ_k × exp(x_i^T β))
+
+with log-link formulation in standard GLM software.
