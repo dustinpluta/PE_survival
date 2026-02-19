@@ -6,12 +6,16 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+from math import exp
+from scipy.stats import norm
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from dataclasses import asdict, dataclass
+from pathlib import Path
+import json
 
 # Increment when you change the returned model dictionary schema
-SCHEMA_VERSION = "pe_fit.v2"
+SCHEMA_VERSION = "pe_fit.v3"
 
 @dataclass(frozen=True)
 class PEFitMinimalConfig:
@@ -87,6 +91,49 @@ def _extract_baseline_theta_lambda(
         "lambda": lam,
     }
 
+def _build_inference_table(
+    params: Dict[str, float],
+    bse: Dict[str, float],
+    interval_col: str,
+) -> List[Dict[str, Any]]:
+    """
+    Build inference table for covariate terms only (exclude baseline C(k) terms).
+    Returns list of row dicts.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for term, beta in params.items():
+
+        # Skip baseline terms
+        if term == "Intercept":
+            continue
+        if term.startswith(f"C({interval_col})"):
+            continue
+
+        se = float(bse.get(term, float("nan")))
+        z = float(beta / se) if se > 0 else float("nan")
+        p = float(2 * (1 - norm.cdf(abs(z)))) if se > 0 else float("nan")
+
+        hr = float(exp(beta))
+        ci_low = float(exp(beta - 1.96 * se)) if se > 0 else float("nan")
+        ci_high = float(exp(beta + 1.96 * se)) if se > 0 else float("nan")
+
+        rows.append(
+            {
+                "term": term,
+                "beta": float(beta),
+                "se": se,
+                "z": z,
+                "p_value": p,
+                "hazard_ratio": hr,
+                "ci_lower_95": ci_low,
+                "ci_upper_95": ci_high,
+            }
+        )
+    return rows
+
+    import json
+
 def fit_pe_minimal(
     long_df: pd.DataFrame,
     covariates: Sequence[str],
@@ -152,6 +199,12 @@ def fit_pe_minimal(
     params = res.params.to_dict()
     bse = res.bse.to_dict()
 
+    inference_table = _build_inference_table(
+    params=params,
+    bse=bse,
+    interval_col=cfg.interval_col,
+    )
+
     baseline = _extract_baseline_theta_lambda(
         params=params,
         interval_col=cfg.interval_col,
@@ -178,9 +231,8 @@ def fit_pe_minimal(
         },
         "params": params,
         "inference": {
-            # Step 1: keep it minimal: SEs only.
-            # Step 4 will add z, p, CI, HR tables, and baseline/covariate separation.
-            "bse": bse
+            "bse": bse,
+            "covariate_table": inference_table,
         },
         "design_info": {
             "exog_names": exog_names,

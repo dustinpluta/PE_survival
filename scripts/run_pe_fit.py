@@ -14,7 +14,6 @@ from pe.fit import PEFitMinimalConfig, fit_pe_minimal
 def _parse_csv_list(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
-
 def main() -> None:
     ap = argparse.ArgumentParser(description="Minimal PE fit from long-format CSV.")
     ap.add_argument("--long_csv", required=True, help="Long-format CSV (output of expand_long)")
@@ -22,7 +21,7 @@ def main() -> None:
     ap.add_argument("--covariates", required=True, help="Comma-separated covariate columns")
     ap.add_argument("--categorical", default="", help="Comma-separated subset of covariates treated as categorical")
     ap.add_argument("--eps", type=float, default=1e-12, help="Floor for y in log-offset")
-
+    ap.add_argument("--verbose", type=bool, default=True, help="Print model diagnostics")
     args = ap.parse_args()
 
     df = pd.read_csv(args.long_csv)
@@ -49,5 +48,6 @@ def main() -> None:
     print(fit["design_info"]["interval_levels"][:5])
     print(fit["design_info"]["categorical_levels"].keys())
     print(fit["baseline"]["K"])
+    print(fit["inference"]["covariate_table"])
 if __name__ == "__main__":
     main()
