@@ -130,7 +130,7 @@ def predict_long(
 def predict_subject_cumhaz(
     long_df: pd.DataFrame,
     model: Dict[str, Any],
-    id_col: str = "__row_id__",
+    id_col: str = "id",
 ) -> pd.DataFrame:
     """
     Compute subject-level cumulative hazard H_i = sum_k y_ik * hazard_ik

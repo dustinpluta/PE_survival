@@ -77,7 +77,7 @@ def main() -> None:
     cfg = ExpandLongConfig(
         time_col=args.time_col,
         event_col=args.event_col,
-        id_col="__row_id__",
+        id_col="id",
         keep_cols=keep_cols,
         clip_to_followup=True,
         eps=float(args.eps),

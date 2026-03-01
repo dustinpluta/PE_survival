@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -12,7 +12,13 @@ import pandas as pd
 class ExpandLongConfig:
     time_col: str = "time"
     event_col: str = "event"
-    id_col: str = "__row_id__"
+
+    # Canonical subject id column (stable across base/long).
+    id_col: str = "id"
+
+    # Optional legacy alias to keep older code working.
+    legacy_id_col: Optional[str] = None
+
     keep_cols: Optional[Sequence[str]] = None
     clip_to_followup: bool = True
     eps: float = 1e-12
@@ -49,6 +55,46 @@ def validate_survival_df(df: pd.DataFrame, time_col: str, event_col: str) -> Non
         raise ValueError(f"Event column must be coded 0/1; found values={sorted(vals)}")
 
 
+def ensure_id_columns(df: pd.DataFrame, cfg: ExpandLongConfig) -> pd.DataFrame:
+    """
+    Ensure canonical id_col exists and is unique integer-like.
+    Optionally create legacy_id_col as an alias to id_col.
+    """
+    out = df.copy()
+
+    if cfg.id_col not in out.columns:
+        out[cfg.id_col] = np.arange(len(out), dtype=int)
+    else:
+        s = out[cfg.id_col]
+        if s.isna().any():
+            raise ValueError(f"'{cfg.id_col}' contains NA")
+        try:
+            s_int = pd.to_numeric(s, errors="raise").astype(int)
+        except Exception as e:
+            raise ValueError(f"'{cfg.id_col}' must be integer-like") from e
+        if s_int.nunique(dropna=False) != len(out):
+            raise ValueError(f"'{cfg.id_col}' must be unique per row/subject")
+        out[cfg.id_col] = s_int
+
+    if cfg.legacy_id_col:
+        if cfg.legacy_id_col not in out.columns:
+            out[cfg.legacy_id_col] = out[cfg.id_col]
+        else:
+            # If legacy exists, require it matches id
+            legacy = pd.to_numeric(out[cfg.legacy_id_col], errors="coerce")
+            if legacy.isna().any():
+                raise ValueError(f"'{cfg.legacy_id_col}' contains NA / non-numeric")
+            legacy_int = legacy.astype(int)
+            if not np.all(legacy_int.to_numpy() == out[cfg.id_col].to_numpy()):
+                raise ValueError(
+                    f"'{cfg.legacy_id_col}' exists but does not match '{cfg.id_col}'. "
+                    "Either drop it from the input or set legacy_id_col=None."
+                )
+            out[cfg.legacy_id_col] = legacy_int
+
+    return out
+
+
 def choose_keep_cols(df: pd.DataFrame, cfg: ExpandLongConfig) -> list[str]:
     if cfg.keep_cols is None:
         keep = [c for c in df.columns if c not in (cfg.time_col, cfg.event_col)]
@@ -58,8 +104,8 @@ def choose_keep_cols(df: pd.DataFrame, cfg: ExpandLongConfig) -> list[str]:
             raise ValueError(f"keep_cols contains missing columns: {missing}")
         keep = list(cfg.keep_cols)
 
-    # Never carry id_col as a covariate
-    keep = [c for c in keep if c != cfg.id_col]
+    # Never carry id columns as covariates
+    keep = [c for c in keep if c not in (cfg.id_col, cfg.legacy_id_col)]
     return keep
 
 
@@ -69,19 +115,18 @@ def choose_keep_cols(df: pd.DataFrame, cfg: ExpandLongConfig) -> list[str]:
 def make_base(df: pd.DataFrame, breaks: np.ndarray, cfg: Optional[ExpandLongConfig] = None) -> pd.DataFrame:
     """
     Returns a clean subject-level table with:
-      - cfg.id_col = 0..n-1 (always)
+      - cfg.id_col preserved if present, else created as 0..n-1
+      - cfg.legacy_id_col (optional) == cfg.id_col
       - time_col optionally clipped to follow-up
       - event_col as int 0/1
       - kept covariates
-
-    No long expansion yet.
     """
     cfg = cfg or ExpandLongConfig()
     br = validate_breaks(breaks)
     validate_survival_df(df, cfg.time_col, cfg.event_col)
 
     base = df.reset_index(drop=True).copy()
-    base[cfg.id_col] = np.arange(len(base), dtype=int)
+    base = ensure_id_columns(base, cfg)
 
     if cfg.clip_to_followup:
         base[cfg.time_col] = np.minimum(base[cfg.time_col].to_numpy(float), float(br[-1]))
@@ -89,10 +134,26 @@ def make_base(df: pd.DataFrame, breaks: np.ndarray, cfg: Optional[ExpandLongConf
     base[cfg.event_col] = base[cfg.event_col].astype(int)
 
     keep = choose_keep_cols(base, cfg)
-    cols = [cfg.id_col, cfg.time_col, cfg.event_col] + keep
-    base = base.loc[:, cols]
 
-    # Guard: no duplicate columns
+    # Build column list, but ensure no duplicates even if input already had legacy columns
+    id_cols = [cfg.id_col]
+    if cfg.legacy_id_col:
+        id_cols.append(cfg.legacy_id_col)
+
+    # Remove any id/legacy columns from keep (belt + suspenders)
+    drop_set = set(id_cols + [cfg.time_col, cfg.event_col])
+    keep = [c for c in keep if c not in drop_set]
+
+    # Assemble and de-duplicate while preserving order
+    cols_raw = id_cols + [cfg.time_col, cfg.event_col] + keep
+    seen = set()
+    cols = []
+    for c in cols_raw:
+        if c not in seen:
+            cols.append(c)
+            seen.add(c)
+
+    base = base.loc[:, cols]
     if base.columns.duplicated().any():
         dups = base.columns[base.columns.duplicated()].tolist()
         raise RuntimeError(f"make_base produced duplicate columns: {dups}")
@@ -106,6 +167,7 @@ def make_base(df: pd.DataFrame, breaks: np.ndarray, cfg: Optional[ExpandLongConf
 def expand_exposure(base: pd.DataFrame, breaks: np.ndarray, cfg: Optional[ExpandLongConfig] = None) -> pd.DataFrame:
     """
     Returns long df with exposure y but d is all zeros (not assigned yet).
+    Includes cfg.id_col (and legacy_id_col if enabled).
     """
     cfg = cfg or ExpandLongConfig()
     br = validate_breaks(breaks)
@@ -128,20 +190,27 @@ def expand_exposure(base: pd.DataFrame, breaks: np.ndarray, cfg: Optional[Expand
     T_rep = np.repeat(T, K)
     y = np.maximum(0.0, np.minimum(T_rep, out_right) - out_left)
 
-    long_df = pd.DataFrame(
-        {
-            cfg.id_col: out_id,
-            "k": out_k,
-            "t_left": out_left,
-            "t_right": out_right,
-            "width": out_width,
-            "y": y,
-            "d": np.zeros(n * K, dtype=int),
-        }
-    )
+    data = {
+        cfg.id_col: out_id,
+        "k": out_k,
+        "t_left": out_left,
+        "t_right": out_right,
+        "width": out_width,
+        "y": y,
+        "d": np.zeros(n * K, dtype=int),
+    }
+    if cfg.legacy_id_col:
+        data[cfg.legacy_id_col] = out_id  # alias
 
-    # Attach covariates by repeating base rows
-    cov_cols = [c for c in base.columns if c not in (cfg.time_col, cfg.event_col, cfg.id_col)]
+    long_df = pd.DataFrame(data)
+
+    # Attach covariates by repeating base rows.
+    # Exclude time/event + id columns from covariate replication.
+    exclude = {cfg.time_col, cfg.event_col, cfg.id_col}
+    if cfg.legacy_id_col:
+        exclude.add(cfg.legacy_id_col)
+    cov_cols = [c for c in base.columns if c not in exclude]
+
     cov_rep = base.loc[base.index.repeat(K), cov_cols].reset_index(drop=True)
     long_df = pd.concat([long_df.reset_index(drop=True), cov_rep], axis=1)
 
@@ -155,7 +224,9 @@ def expand_exposure(base: pd.DataFrame, breaks: np.ndarray, cfg: Optional[Expand
 # -------------------------------------------------------
 # Step 3: assign events d_ik using "positive exposure" rule
 # -------------------------------------------------------
-def assign_events(long_df: pd.DataFrame, base: pd.DataFrame, breaks: np.ndarray, cfg: Optional[ExpandLongConfig] = None) -> pd.DataFrame:
+def assign_events(
+    long_df: pd.DataFrame, base: pd.DataFrame, breaks: np.ndarray, cfg: Optional[ExpandLongConfig] = None
+) -> pd.DataFrame:
     """
     Assign exactly one d=1 per event subject, choosing an interval with y>0 when possible.
 
@@ -178,7 +249,7 @@ def assign_events(long_df: pd.DataFrame, base: pd.DataFrame, breaks: np.ndarray,
     k = np.searchsorted(br[1:], T, side="right")
     k = np.clip(k, 0, K - 1).astype(int)
 
-    # check exposure in that interval: y_ik = max(0, min(T, br[k+1]) - br[k])
+    # exposure in that interval
     a = br[k]
     b = br[k + 1]
     yk = np.maximum(0.0, np.minimum(T, b) - a)
@@ -203,8 +274,6 @@ def assign_events(long_df: pd.DataFrame, base: pd.DataFrame, breaks: np.ndarray,
         ev_ids = base.loc[ev_idx, cfg.id_col].to_numpy(int)
         ev_k = k[ev_idx]
 
-        # map (id,k) -> row mask
-        # (fast vector approach)
         key = ev_ids * K + ev_k
         out_key = out[cfg.id_col].to_numpy(int) * K + out["k"].to_numpy(int)
         mark = np.isin(out_key, key)

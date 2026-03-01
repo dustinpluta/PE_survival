@@ -21,7 +21,6 @@ def main() -> None:
     ap.add_argument("--covariates", required=True, help="Comma-separated covariate columns")
     ap.add_argument("--categorical", default="", help="Comma-separated subset of covariates treated as categorical")
     ap.add_argument("--eps", type=float, default=1e-12, help="Floor for y in log-offset")
-    ap.add_argument("--verbose", type=bool, default=True, help="Print model diagnostics")
     args = ap.parse_args()
 
     df = pd.read_csv(args.long_csv)
@@ -42,12 +41,6 @@ def main() -> None:
     print(f"Wrote: {out_path}")
     print(f"Wrote: {summary_path}")
     print(f"Rows={fit['fit_stats']['n_rows']}, Events={fit['fit_stats']['n_events']}, AIC={fit['fit_stats']['aic']:.3f}")
-    print(fit['schema_version'])
-    print(fit['fit_stats'])
-    print(len(fit["design_info"]["exog_names"]))
-    print(fit["design_info"]["interval_levels"][:5])
-    print(fit["design_info"]["categorical_levels"].keys())
-    print(fit["baseline"]["K"])
-    print(fit["inference"]["covariate_table"])
+
 if __name__ == "__main__":
     main()

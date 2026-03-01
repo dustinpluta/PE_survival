@@ -61,12 +61,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--id_col",
-        default="__row_id__",
-        help="Subject id column in long data (default: __row_id__).",
+        default="id",
+        help="Subject id column in long data (default: id).",
     )
-
+    print("################################")
     args = ap.parse_args()
-
+    print(len(args.breaks))
+    
     model_path = Path(args.model)
     long_path = Path(args.long_csv)
     out_dir = Path(args.out_dir)
